@@ -681,21 +681,28 @@ func (ig *injectorGen) funcProviderCall(lname string, c *call, injectSig outputS
 		ig.p(", %s", ig.errVar)
 	}
 	ig.p(" := ")
-	ig.p("%s(", ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name))
-	for i, a := range c.args {
-		if i > 0 {
-			ig.p(", ")
+	
+	// Format function calls with multi-line arguments for better readability
+	if len(c.args) == 0 {
+		// No arguments - keep on single line
+		ig.p("%s()\n", ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name))
+	} else {
+		// Multiple arguments - format each on its own line
+		ig.p("%s(\n", ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name))
+		for i, a := range c.args {
+			ig.p("\t\t")
+			if a < len(ig.paramNames) {
+				ig.p("%s", ig.paramNames[a])
+			} else {
+				ig.p("%s", ig.localNames[a-len(ig.paramNames)])
+			}
+			if c.varargs && i == len(c.args)-1 {
+				ig.p("...")
+			}
+			ig.p(",\n")
 		}
-		if a < len(ig.paramNames) {
-			ig.p("%s", ig.paramNames[a])
-		} else {
-			ig.p("%s", ig.localNames[a-len(ig.paramNames)])
-		}
+		ig.p("\t)\n")
 	}
-	if c.varargs {
-		ig.p("...")
-	}
-	ig.p(")\n")
 	if c.hasErr {
 		ig.p("\tif %s != nil {\n", ig.errVar)
 		for i := prevCleanup - 1; i >= 0; i-- {
