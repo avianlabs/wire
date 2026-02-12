@@ -491,7 +491,22 @@ func (oc *objectCache) get(obj types.Object) (val interface{}, errs []error) {
 			}
 		}
 		pkgPath := obj.Pkg().Path()
-		return oc.processExpr(oc.packages[pkgPath].TypesInfo, pkgPath, spec.Values[i], obj.Name())
+		val, errs = oc.processExpr(oc.packages[pkgPath].TypesInfo, pkgPath, spec.Values[i], obj.Name())
+		// If the resolved provider is from an internal package but was referenced
+		// through a re-export in a non-internal package, redirect the provider
+		// to use the re-export's package and name. This avoids generating imports
+		// of internal packages which violate Go visibility rules.
+		if len(errs) == 0 {
+			if p, ok := val.(*Provider); ok {
+				if p.Pkg.Path() != pkgPath && isInternalPackage(p.Pkg.Path()) {
+					pCopy := *p
+					pCopy.Pkg = obj.Pkg()
+					pCopy.Name = obj.Name()
+					val = &pCopy
+				}
+			}
+		}
+		return
 	case *types.Func:
 		return processFuncProvider(oc.fset, obj)
 	default:
@@ -1244,4 +1259,13 @@ func bindShouldUsePointer(info *types.Info, call *ast.CallExpr) bool {
 	pkgName := fun.X.(*ast.Ident)                       // wire
 	wireName := info.ObjectOf(pkgName).(*types.PkgName) // wire package
 	return wireName.Imported().Scope().Lookup("bindToUsePointer") != nil
+}
+
+// isInternalPackage reports whether the given import path refers to a Go
+// internal package (one containing an "internal" path element).
+func isInternalPackage(path string) bool {
+	return path == "internal" ||
+		strings.HasPrefix(path, "internal/") ||
+		strings.HasSuffix(path, "/internal") ||
+		strings.Contains(path, "/internal/")
 }

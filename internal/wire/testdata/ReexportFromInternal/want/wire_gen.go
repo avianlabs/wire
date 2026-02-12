@@ -10,19 +10,9 @@ import (
 	"example.com/bar"
 )
 
-import (
-	_ "example.com/anon1"
-	_ "example.com/anon2"
-)
-
 // Injectors from wire.go:
 
-func injectFooBar() FooBar {
-	foo := provideFoo()
-	barBar := bar.ProvideBar()
-	fooBar := provideFooBar(
-		foo,
-		barBar,
-	)
-	return fooBar
+func injectedMessage() string {
+	string2 := bar.NewBar()
+	return string2
 }
