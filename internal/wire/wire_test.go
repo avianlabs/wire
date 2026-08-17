@@ -24,6 +24,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -88,18 +89,14 @@ func TestWire(t *testing.T) {
 				t.Fatal(err)
 			}
 			wd := filepath.Join(gopath, "src", "example.com")
-			gens, errs := Generate(ctx, wd, append(os.Environ(), "GOPATH="+gopath), []string{test.pkg}, &GenerateOptions{Header: test.header})
-			var gen GenerateResult
-			if len(gens) > 1 {
-				t.Fatalf("got %d generated files, want 0 or 1", len(gens))
-			}
-			if len(gens) == 1 {
-				gen = gens[0]
+			gens, errs := Generate(ctx, wd, append(os.Environ(), "GOPATH="+gopath), test.patterns, &GenerateOptions{Header: test.header})
+			for _, gen := range gens {
 				if len(gen.Errs) > 0 {
 					errs = append(errs, gen.Errs...)
 				}
 				if len(gen.Content) > 0 {
-					defer t.Logf("wire_gen.go:\n%s", gen.Content)
+					gen := gen
+					defer t.Logf("%s:\n%s", filepath.Base(gen.OutputPath), gen.Content)
 				}
 			}
 			if len(errs) > 0 {
@@ -126,10 +123,23 @@ func TestWire(t *testing.T) {
 			if test.wantWireError {
 				t.Fatal("wire succeeded; want error")
 			}
-			outPathSane := true
-			if prefix := gopath + string(os.PathSeparator) + "src" + string(os.PathSeparator); !strings.HasPrefix(gen.OutputPath, prefix) {
-				outPathSane = false
-				t.Errorf("suggested output path = %q; want to start with %q", gen.OutputPath, prefix)
+			// Collect the non-empty generated files, keyed by golden path.
+			got := make(map[string][]byte)
+			for _, gen := range gens {
+				if len(gen.Content) == 0 {
+					continue
+				}
+				if prefix := gopath + string(os.PathSeparator) + "src" + string(os.PathSeparator); !strings.HasPrefix(gen.OutputPath, prefix) {
+					t.Fatalf("suggested output path = %q; want to start with %q", gen.OutputPath, prefix)
+				}
+				key, err := test.goldenKey(gopath, gen.OutputPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := got[key]; ok {
+					t.Fatalf("Generate returned duplicate outputs for %s", key)
+				}
+				got[key] = gen.Content
 			}
 
 			if *record {
@@ -137,28 +147,75 @@ func TestWire(t *testing.T) {
 				// check that the program's output matches the
 				// expected output, save wire output on
 				// success.
-				if !outPathSane {
-					return
-				}
-				if err := gen.Commit(); err != nil {
-					t.Fatalf("failed to write wire_gen.go to test GOPATH: %v", err)
+				for _, gen := range gens {
+					if err := gen.Commit(); err != nil {
+						t.Fatalf("failed to write %s to test GOPATH: %v", filepath.Base(gen.OutputPath), err)
+					}
 				}
 				if err := goBuildCheck(goToolPath, gopath, test); err != nil {
 					t.Fatalf("go build check failed: %v", err)
 				}
-				testdataWireGenPath := filepath.Join(testRoot, test.name, "want", "wire_gen.go")
-				if err := ioutil.WriteFile(testdataWireGenPath, gen.Content, 0666); err != nil {
-					t.Fatalf("failed to record wire_gen.go to testdata: %v", err)
+				wantDir := filepath.Join(testRoot, test.name, "want")
+				for key, content := range got {
+					goldenPath := filepath.Join(wantDir, filepath.FromSlash(key))
+					if err := os.MkdirAll(filepath.Dir(goldenPath), 0777); err != nil {
+						t.Fatalf("failed to create golden dir: %v", err)
+					}
+					if err := ioutil.WriteFile(goldenPath, content, 0666); err != nil {
+						t.Fatalf("failed to record %s to testdata: %v", key, err)
+					}
+				}
+				// Remove stale golden .go files that Generate no longer produces.
+				err := filepath.Walk(wantDir, func(src string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					if !info.Mode().IsRegular() || filepath.Ext(src) != ".go" {
+						return nil
+					}
+					if info.Size() == 0 {
+						// An empty golden file records that wire must
+						// generate nothing for this package; keep it.
+						return nil
+					}
+					rel, err := filepath.Rel(wantDir, src)
+					if err != nil {
+						return err
+					}
+					if _, ok := got[filepath.ToSlash(rel)]; !ok {
+						return os.Remove(src)
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("failed to prune stale golden files: %v", err)
 				}
 			} else {
-				// Replay ==> Load golden file and compare to
-				// generated result. This check is meant to
+				// Replay ==> Load golden files and compare to
+				// generated results. This check is meant to
 				// detect non-deterministic behavior in the
 				// Generate function.
-				if !bytes.Equal(gen.Content, test.wantWireOutput) {
-					gotS, wantS := string(gen.Content), string(test.wantWireOutput)
-					diff := cmp.Diff(strings.Split(gotS, "\n"), strings.Split(wantS, "\n"))
-					t.Fatalf("wire output differs from golden file. If this change is expected, run with -record to update the wire_gen.go file.\n*** got:\n%s\n\n*** want:\n%s\n\n*** diff:\n%s", gotS, wantS, diff)
+				for key, want := range test.wantOutputs {
+					content, ok := got[key]
+					if !ok {
+						if len(want) == 0 {
+							// An empty golden file records that wire must
+							// generate nothing for this package.
+							continue
+						}
+						t.Errorf("Generate did not produce %s; golden file exists. If this change is expected, run with -record.", key)
+						continue
+					}
+					if !bytes.Equal(content, want) {
+						gotS, wantS := string(content), string(want)
+						diff := cmp.Diff(strings.Split(gotS, "\n"), strings.Split(wantS, "\n"))
+						t.Errorf("wire output for %s differs from golden file. If this change is expected, run with -record to update it.\n*** got:\n%s\n\n*** want:\n%s\n\n*** diff:\n%s", key, gotS, wantS, diff)
+					}
+				}
+				for key := range got {
+					if _, ok := test.wantOutputs[key]; !ok {
+						t.Errorf("Generate produced %s, which has no golden file. If this change is expected, run with -record.", key)
+					}
 				}
 			}
 		})
@@ -424,14 +481,43 @@ func scrubLineColumn(s string) (replacement string, n int) {
 }
 
 type testCase struct {
-	name                 string
-	pkg                  string
-	header               []byte
-	goFiles              map[string][]byte
-	wantProgramOutput    []byte
-	wantWireOutput       []byte
+	name    string
+	pkg     string
+	header  []byte
+	goFiles map[string][]byte
+	// patterns is every package pattern passed to Generate. The first
+	// entry is pkg, the main package built by goBuildCheck.
+	patterns          []string
+	wantProgramOutput []byte
+	// wantOutputs maps a golden file path relative to the test's want/
+	// directory (e.g. "wire_gen.go", "bar/wire_singleton_gen.go") to its
+	// expected contents.
+	wantOutputs          map[string][]byte
 	wantWireError        bool
 	wantWireErrorStrings []string
+}
+
+// goldenKey maps a generated file path to its golden file path relative
+// to the test's want/ directory. The main package's wire_gen.go keeps the
+// historical top-level "wire_gen.go" name; every other generated file is
+// stored under its package directory relative to example.com.
+func (test *testCase) goldenKey(gopath, outputPath string) (string, error) {
+	root := filepath.Join(gopath, "src", "example.com")
+	rel, err := filepath.Rel(root, outputPath)
+	if err != nil {
+		return "", err
+	}
+	rel = filepath.ToSlash(rel)
+	if strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("generated file %s is outside example.com", outputPath)
+	}
+	// The primary pattern may be an import path (example.com/foo) or a
+	// path relative to the example.com directory (./foo).
+	primaryDir := path.Clean(strings.TrimPrefix(test.pkg, "example.com/"))
+	if rel == primaryDir+"/wire_gen.go" {
+		return "wire_gen.go", nil
+	}
+	return rel, nil
 }
 
 // loadTestCase reads a test case from a directory.
@@ -465,13 +551,17 @@ type testCase struct {
 //					missing if wire_errs.txt is present
 func loadTestCase(root string, wireGoSrc []byte) (*testCase, error) {
 	name := filepath.Base(root)
-	pkg, err := ioutil.ReadFile(filepath.Join(root, "pkg"))
+	pkgb, err := ioutil.ReadFile(filepath.Join(root, "pkg"))
 	if err != nil {
 		return nil, fmt.Errorf("load test case %s: %v", name, err)
 	}
+	patterns := strings.Fields(string(pkgb))
+	if len(patterns) == 0 {
+		return nil, fmt.Errorf("load test case %s: pkg file is empty", name)
+	}
 	header, _ := ioutil.ReadFile(filepath.Join(root, "header"))
 	var wantProgramOutput []byte
-	var wantWireOutput []byte
+	wantOutputs := make(map[string][]byte)
 	wireErrb, err := ioutil.ReadFile(filepath.Join(root, "want", "wire_errs.txt"))
 	wantWireError := err == nil
 	var wantWireErrorStrings []string
@@ -482,9 +572,30 @@ func loadTestCase(root string, wireGoSrc []byte) (*testCase, error) {
 		}
 	} else {
 		if !*record {
-			wantWireOutput, err = ioutil.ReadFile(filepath.Join(root, "want", "wire_gen.go"))
+			wantDir := filepath.Join(root, "want")
+			err := filepath.Walk(wantDir, func(src string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.Mode().IsRegular() || filepath.Ext(src) != ".go" {
+					return nil
+				}
+				rel, err := filepath.Rel(wantDir, src)
+				if err != nil {
+					return err
+				}
+				data, err := ioutil.ReadFile(src)
+				if err != nil {
+					return err
+				}
+				wantOutputs[filepath.ToSlash(rel)] = data
+				return nil
+			})
 			if err != nil {
-				return nil, fmt.Errorf("load test case %s: %v, if this is a new testcase, run with -record to generate the wire_gen.go file", name, err)
+				return nil, fmt.Errorf("load test case %s: %v", name, err)
+			}
+			if len(wantOutputs) == 0 {
+				return nil, fmt.Errorf("load test case %s: no golden .go files under want/; if this is a new testcase, run with -record to generate them", name)
 			}
 		}
 		wantProgramOutput, err = ioutil.ReadFile(filepath.Join(root, "want", "program_out.txt"))
@@ -522,10 +633,11 @@ func loadTestCase(root string, wireGoSrc []byte) (*testCase, error) {
 	}
 	return &testCase{
 		name:                 name,
-		pkg:                  string(bytes.TrimSpace(pkg)),
+		pkg:                  patterns[0],
+		patterns:             patterns,
 		header:               header,
 		goFiles:              goFiles,
-		wantWireOutput:       wantWireOutput,
+		wantOutputs:          wantOutputs,
 		wantProgramOutput:    wantProgramOutput,
 		wantWireError:        wantWireError,
 		wantWireErrorStrings: wantWireErrorStrings,
