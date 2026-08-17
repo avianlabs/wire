@@ -464,20 +464,45 @@ of the provider's inputs and must have the signature `func()`.
 ### Singleton Providers
 
 `wire.Singleton` wraps a provider function so that generated injectors
-memoize its result. When obtained via the singleton, the provider runs at
-most once per generated package: the first injector call to need the value
-invokes the provider, and every subsequent request — from the same injector
-or any other injector in the same generated package — receives the same
-value. This is useful for expensive shared resources such as database pools
-or API clients. Uses of the same provider function that bypass the
-singleton wrapper (e.g. called directly elsewhere in the provider set) are
-unaffected and are not memoized.
+memoize its result. Wire generates a memoizing wrapper into the package
+that contains the `wire.Singleton` call, in a file named
+`wire_singleton_gen.go`. Every injector that obtains the value via the
+singleton — no matter which package it is generated into — calls that
+shared wrapper, so the provider runs at most once per binary and all
+injectors receive the same value. This is useful for expensive shared
+resources such as database pools or API clients. Uses of the same provider
+function that bypass the singleton wrapper (e.g. called directly elsewhere
+in the provider set) are unaffected and are not memoized.
 
 ```go
+// package clients
 var Set = wire.NewSet(
     wire.Singleton(NewFoo),
     NewBar,
 )
+```
+
+Injectors in any package can then use the set, and they all share one
+`Foo`:
+
+```go
+// package main
+func injectApp() *App {
+    panic(wire.Build(clients.Set, newApp))
+}
+```
+
+Running `wire` on the injector's package also (re)generates
+`clients/wire_singleton_gen.go`, which contains an exported wrapper such
+as:
+
+```go
+func SingletonNewFoo() *Foo {
+    singletonNewFooOnce.Do(func() {
+        singletonNewFooValue = NewFoo()
+    })
+    return singletonNewFooValue
+}
 ```
 
 Only a provider function may be wrapped; `wire.Struct`, `wire.Value`,
@@ -485,11 +510,16 @@ struct literals, and provider sets are rejected at generation time.
 
 Semantics to be aware of:
 
--   **Scope is the generated package**, not the whole binary. The
-    memoization state lives in `wire_gen.go`, so injectors generated into
-    different packages each get their own instance. If all of your
-    injectors live in one wiring package (the common case), the singleton
-    is effectively per-binary.
+-   **State lives where the `wire.Singleton` call is.** The wrapper file
+    covers every `wire.Singleton` call in that package, so its content is
+    the same no matter which injector package triggered generation, and
+    concurrent `wire` runs write identical bytes. The declaring package
+    must be part of your module: wrapping a provider from a dependency is
+    fine, but the `wire.Singleton` call itself must live in code you
+    generate into.
+-   **The wrapper is exported.** Its name is derived from the provider
+    (`NewFoo` → `SingletonNewFoo`), and it becomes part of the declaring
+    package's generated API so injectors in other packages can call it.
 -   **The first call's arguments win.** Because the provider runs once,
     arguments passed by later injector calls are ignored.
 -   **Errors are sticky.** If the provider returns an error, the error is

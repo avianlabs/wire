@@ -6,14 +6,10 @@
 
 package main
 
-import (
-	"sync"
-)
-
 // Injectors from wire.go:
 
 func injectFooBar() *FooBar {
-	foo := _wireFooSingleton()
+	foo := SingletonProvideFoo()
 	fooBar := provideFooBar(
 		foo,
 	)
@@ -21,23 +17,9 @@ func injectFooBar() *FooBar {
 }
 
 func injectFooBaz() *FooBaz {
-	foo := _wireFooSingleton()
+	foo := SingletonProvideFoo()
 	fooBaz := provideFooBaz(
 		foo,
 	)
 	return fooBaz
-}
-
-// Singleton wrappers:
-
-var (
-	_wireFooSingletonOnce  sync.Once
-	_wireFooSingletonValue *Foo
-)
-
-func _wireFooSingleton() *Foo {
-	_wireFooSingletonOnce.Do(func() {
-		_wireFooSingletonValue = provideFoo()
-	})
-	return _wireFooSingletonValue
 }

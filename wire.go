@@ -199,20 +199,23 @@ func FieldsOf(structType interface{}, fieldNames ...string) StructFields {
 type SingletonProvider struct{}
 
 // Singleton wraps a provider function so that generated injectors memoize
-// its result. When obtained via the singleton, the provider runs at most
-// once per generated package: the first injector call to need the value
-// invokes the provider, and every subsequent request — from the same
-// injector or any other injector in the same generated package — receives
-// the same value.
+// its result. Wire generates a memoizing wrapper into the package that
+// contains the wire.Singleton call, in a file named wire_singleton_gen.go.
+// Every injector that obtains the value via the singleton — no matter which
+// package it is generated into — calls that shared wrapper, so the provider
+// runs at most once per binary and all injectors receive the same value.
 //
 // Only a provider function may be wrapped: wire.Struct, wire.Value, struct
 // literals, and provider sets are rejected at generation time.
 //
 // Semantics:
 //
-//   - Scope is the generated package (wire_gen.go), not the whole binary.
-//     Injectors generated into different packages each get their own
-//     instance.
+//   - The memoization state lives in the package containing the
+//     wire.Singleton call. That package must be writable when wire runs
+//     (it is regenerated alongside the injectors that use it).
+//   - The wrapper function is exported (e.g. SingletonNewFoo) so injectors
+//     in other packages can call it; it is part of the declaring package's
+//     generated API.
 //   - The provider's arguments are taken from the first call that creates
 //     the value; arguments passed by later calls are ignored.
 //   - If the provider returns an error, the error is cached: the provider
