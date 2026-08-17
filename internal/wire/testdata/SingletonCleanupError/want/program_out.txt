@@ -1,0 +1,13 @@
+opts 2
+<nil>
+1
+true
+1
+cleanup foo 1
+opts 0
+2
+3
+cleanup foo 3
+baz boom
+baz boom
+1

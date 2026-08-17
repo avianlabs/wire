@@ -455,11 +455,14 @@ of the provider's inputs and must have the signature `func()`.
 ### Singleton Providers
 
 `wire.Singleton` wraps a provider function so that generated injectors
-memoize its result. The provider runs at most once per generated package:
-the first injector call to need the value invokes the provider, and every
-subsequent request — from the same injector or any other injector in the
-same generated package — receives the same value. This is useful for
-expensive shared resources such as database pools or API clients.
+memoize its result. When obtained via the singleton, the provider runs at
+most once per generated package: the first injector call to need the value
+invokes the provider, and every subsequent request — from the same injector
+or any other injector in the same generated package — receives the same
+value. This is useful for expensive shared resources such as database pools
+or API clients. Uses of the same provider function that bypass the
+singleton wrapper (e.g. called directly elsewhere in the provider set) are
+unaffected and are not memoized.
 
 ```go
 var Set = wire.NewSet(

@@ -44,6 +44,9 @@ func _wireFooSingleton() (*Foo, func()) {
 func _wireFooSingletonRelease() {
 	_wireFooSingletonMu.Lock()
 	defer _wireFooSingletonMu.Unlock()
+	if _wireFooSingletonRefs == 0 {
+		return
+	}
 	_wireFooSingletonRefs--
 	if _wireFooSingletonRefs == 0 {
 		if _wireFooSingletonCleanup != nil {
