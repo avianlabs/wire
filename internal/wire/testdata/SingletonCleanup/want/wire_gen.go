@@ -6,53 +6,14 @@
 
 package main
 
-import (
-	"sync"
-)
-
 // Injectors from wire.go:
 
 func injectBar() (*Bar, func()) {
-	foo, cleanup := _wireFooSingleton()
+	foo, cleanup := SingletonProvideFoo()
 	bar := provideBar(
 		foo,
 	)
 	return bar, func() {
 		cleanup()
-	}
-}
-
-// Singleton wrappers:
-
-var (
-	_wireFooSingletonMu      sync.Mutex
-	_wireFooSingletonRefs    int
-	_wireFooSingletonValue   *Foo
-	_wireFooSingletonCleanup func()
-)
-
-func _wireFooSingleton() (*Foo, func()) {
-	_wireFooSingletonMu.Lock()
-	defer _wireFooSingletonMu.Unlock()
-	if _wireFooSingletonRefs == 0 {
-		_wireFooSingletonValue, _wireFooSingletonCleanup = provideFoo()
-	}
-	_wireFooSingletonRefs++
-	return _wireFooSingletonValue, _wireFooSingletonRelease
-}
-
-func _wireFooSingletonRelease() {
-	_wireFooSingletonMu.Lock()
-	defer _wireFooSingletonMu.Unlock()
-	if _wireFooSingletonRefs == 0 {
-		return
-	}
-	_wireFooSingletonRefs--
-	if _wireFooSingletonRefs == 0 {
-		if _wireFooSingletonCleanup != nil {
-			_wireFooSingletonCleanup()
-		}
-		_wireFooSingletonValue = nil
-		_wireFooSingletonCleanup = nil
 	}
 }

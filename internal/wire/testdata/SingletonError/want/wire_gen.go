@@ -6,31 +6,12 @@
 
 package main
 
-import (
-	"sync"
-)
-
 // Injectors from wire.go:
 
 func injectFoo() (*Foo, error) {
-	foo, err := _wireFooSingleton()
+	foo, err := SingletonProvideFoo()
 	if err != nil {
 		return nil, err
 	}
 	return foo, nil
-}
-
-// Singleton wrappers:
-
-var (
-	_wireFooSingletonOnce  sync.Once
-	_wireFooSingletonValue *Foo
-	_wireFooSingletonErr   error
-)
-
-func _wireFooSingleton() (*Foo, error) {
-	_wireFooSingletonOnce.Do(func() {
-		_wireFooSingletonValue, _wireFooSingletonErr = provideFoo()
-	})
-	return _wireFooSingletonValue, _wireFooSingletonErr
 }

@@ -83,6 +83,11 @@ type call struct {
 	// wire.Singleton and must go through the generated wrapper.
 	isSingleton bool
 
+	// singletonPkgPath is the import path of the package containing the
+	// wire.Singleton call, where the memoizing wrapper is generated.
+	// Empty unless isSingleton is true.
+	singletonPkgPath string
+
 	// The following are only set for kind == valueExpr:
 
 	valueExpr     ast.Expr
@@ -210,6 +215,8 @@ dfs:
 				hasCleanup:  p.HasCleanup,
 				hasErr:      p.HasErr,
 				isSingleton: p.IsSingleton,
+
+				singletonPkgPath: p.SingletonPkgPath,
 			})
 		case pv.IsValue():
 			v := pv.Value()

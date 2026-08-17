@@ -170,9 +170,15 @@ type Provider struct {
 	IsStruct bool
 
 	// IsSingleton is true if this provider was wrapped in wire.Singleton.
-	// Generated code memoizes the provider's result per generated package.
-	// (Always false for structs.)
+	// The provider's result is memoized by a wrapper generated into the
+	// package that contains the wire.Singleton call, so every injector in
+	// the binary shares one instance. (Always false for structs.)
 	IsSingleton bool
+
+	// SingletonPkgPath is the import path of the package containing the
+	// wire.Singleton call. The memoizing wrapper is generated into that
+	// package. Empty unless IsSingleton is true.
+	SingletonPkgPath string
 
 	// Out is the set of types this provider produces. It will always
 	// contain at least one type.
@@ -753,6 +759,7 @@ func (oc *objectCache) processSingleton(info *types.Info, pkgPath string, call *
 	// same function must remain usable un-wrapped elsewhere.
 	pCopy := *p
 	pCopy.IsSingleton = true
+	pCopy.SingletonPkgPath = pkgPath
 	return &pCopy, nil
 }
 

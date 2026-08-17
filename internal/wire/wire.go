@@ -88,6 +88,28 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 	if len(errs) > 0 {
 		return nil, errs
 	}
+	oc := newObjectCache(pkgs)
+	// The singleton index is shared across every generated package so all
+	// of them agree on wrapper names, and each declaring package's
+	// wire_singleton_gen.go is computed only once.
+	singletonCache := make(map[string]*pkgSingletons)
+	singletonCacheErrs := make(map[string][]error)
+	singletonIndex := func(pkgPath string) (*pkgSingletons, []error) {
+		if ps, ok := singletonCache[pkgPath]; ok {
+			return ps, singletonCacheErrs[pkgPath]
+		}
+		var ps *pkgSingletons
+		var errs []error
+		if dpkg := oc.packages[pkgPath]; dpkg == nil {
+			errs = []error{fmt.Errorf("internal error: package %s not loaded for singleton generation", pkgPath)}
+		} else {
+			ps, errs = findPackageSingletons(oc, dpkg)
+		}
+		singletonCache[pkgPath] = ps
+		singletonCacheErrs[pkgPath] = errs
+		return ps, errs
+	}
+	usedSingletonPkgs := make(map[string]bool)
 	generated := make([]GenerateResult, len(pkgs))
 	for i, pkg := range pkgs {
 		generated[i].PkgPath = pkg.PkgPath
@@ -98,13 +120,16 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 		}
 		generated[i].OutputPath = filepath.Join(outDir, opts.PrefixOutputFile+"wire_gen.go")
 		g := newGen(pkg)
-		injectorFiles, errs := generateInjectors(g, pkg)
+		g.singletonIndex = singletonIndex
+		injectorFiles, errs := generateInjectors(g, oc, pkg)
+		for path := range g.usedSingletonPkgs {
+			usedSingletonPkgs[path] = true
+		}
 		if len(errs) > 0 {
 			generated[i].Errs = errs
 			continue
 		}
 		copyNonInjectorDecls(g, injectorFiles, pkg.TypesInfo)
-		g.emitSingletons()
 		goSrc := g.frame(opts.Tags)
 		if len(opts.Header) > 0 {
 			goSrc = append(opts.Header, goSrc...)
@@ -118,6 +143,44 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 			goSrc = fmtSrc
 		}
 		generated[i].Content = goSrc
+	}
+	// Generate one wire_singleton_gen.go per package that declares a
+	// wire.Singleton used by the injectors above. The file holds wrappers
+	// for every wire.Singleton call in that package, so its content does
+	// not depend on which injector packages were generated.
+	singletonPaths := make([]string, 0, len(usedSingletonPkgs))
+	for path := range usedSingletonPkgs {
+		singletonPaths = append(singletonPaths, path)
+	}
+	sort.Strings(singletonPaths)
+	for _, path := range singletonPaths {
+		ps, errs := singletonIndex(path)
+		if len(errs) > 0 || ps == nil || len(ps.ordered) == 0 {
+			// Resolution errors were already reported by inject.
+			continue
+		}
+		res := GenerateResult{PkgPath: path}
+		outDir, err := detectOutputDir(ps.pkg.GoFiles)
+		if err != nil {
+			res.Errs = append(res.Errs, err)
+			generated = append(generated, res)
+			continue
+		}
+		res.OutputPath = filepath.Join(outDir, opts.PrefixOutputFile+"wire_singleton_gen.go")
+		sg := newGen(ps.pkg)
+		sg.emitPackageSingletons(ps)
+		goSrc := sg.frame(opts.Tags)
+		if len(opts.Header) > 0 {
+			goSrc = append(opts.Header, goSrc...)
+		}
+		fmtSrc, err := format.Source(goSrc)
+		if err != nil {
+			res.Errs = append(res.Errs, err)
+		} else {
+			goSrc = fmtSrc
+		}
+		res.Content = goSrc
+		generated = append(generated, res)
 	}
 	return generated, nil
 }
@@ -136,8 +199,7 @@ func detectOutputDir(paths []string) (string, error) {
 }
 
 // generateInjectors generates the injectors for a given package.
-func generateInjectors(g *gen, pkg *packages.Package) (injectorFiles []*ast.File, _ []error) {
-	oc := newObjectCache([]*packages.Package{pkg})
+func generateInjectors(g *gen, oc *objectCache, pkg *packages.Package) (injectorFiles []*ast.File, _ []error) {
 	injectorFiles = make([]*ast.File, 0, len(pkg.Syntax))
 	ec := new(errorCollector)
 	for _, f := range pkg.Syntax {
@@ -247,23 +309,24 @@ type gen struct {
 	imports     map[string]importInfo
 	anonImports map[string]bool
 	values      map[ast.Expr]string
-	// singletons maps provider identity (pkgpath.FuncName) to the wrapper
-	// generated for a wire.Singleton provider. Injectors in the same
-	// package share one wrapper — that sharing is the singleton.
-	singletons map[string]*singleton
-	// singletonNames records every identifier allocated for singleton
-	// wrappers so nameInFileScope avoids them.
-	singletonNames map[string]bool
+	// singletonIndex resolves the canonical singleton wrappers declared
+	// in a package. It is shared by every gen in one Generate run so all
+	// generated packages agree on wrapper names. Nil for the gen that
+	// emits a wire_singleton_gen.go file, which never resolves wrappers.
+	singletonIndex func(pkgPath string) (*pkgSingletons, []error)
+	// usedSingletonPkgs records the import paths of packages whose
+	// singleton wrappers this generated package references, so Generate
+	// knows which wire_singleton_gen.go files to produce.
+	usedSingletonPkgs map[string]bool
 }
 
 func newGen(pkg *packages.Package) *gen {
 	return &gen{
-		pkg:            pkg,
-		anonImports:    make(map[string]bool),
-		imports:        make(map[string]importInfo),
-		values:         make(map[ast.Expr]string),
-		singletons:     make(map[string]*singleton),
-		singletonNames: make(map[string]bool),
+		pkg:               pkg,
+		anonImports:       make(map[string]bool),
+		imports:           make(map[string]importInfo),
+		values:            make(map[ast.Expr]string),
+		usedSingletonPkgs: make(map[string]bool),
 	}
 }
 
@@ -354,6 +417,11 @@ func (g *gen) inject(pos token.Pos, name string, sig *types.Signature, set *Prov
 			ec.add(notePosition(
 				g.pkg.Fset.Position(pos),
 				fmt.Errorf("inject %s: provider for %s returns error but injection not allowed to fail", name, ts)))
+		}
+		if c.kind == funcProviderCall && c.isSingleton {
+			if _, errs := g.singletonCallee(c); len(errs) > 0 {
+				ec.add(notePositionAll(g.pkg.Fset.Position(pos), errs)...)
+			}
 		}
 		if c.kind == valueExpr {
 			if err := accessibleFrom(c.valueTypeInfo, c.valueExpr, g.pkg.PkgPath); err != nil {
@@ -572,9 +640,6 @@ func (g *gen) nameInFileScope(name string) bool {
 			return true
 		}
 	}
-	if g.singletonNames[name] {
-		return true
-	}
 	_, obj := g.pkg.Types.Scope().LookupParent(name, token.NoPos)
 	return obj != nil
 }
@@ -685,7 +750,8 @@ func injectPass(name string, sig *types.Signature, calls []call, set *ProviderSe
 func (ig *injectorGen) funcProviderCall(lname string, c *call, injectSig outputSignature) {
 	callee := ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name)
 	if c.isSingleton {
-		callee = ig.g.singleton(c)
+		// Resolution errors were already reported by inject.
+		callee, _ = ig.g.singletonCallee(c)
 	}
 	ig.p("\t%s", lname)
 	prevCleanup := len(ig.cleanupNames)
@@ -795,62 +861,138 @@ type singleton struct {
 	releaseName string
 }
 
-// singleton returns the wrapper function name for the provider behind c,
-// registering the wrapper (and reserving its identifiers) on first use.
-func (g *gen) singleton(c *call) string {
-	key := c.pkg.Path() + "." + c.name
-	if s, ok := g.singletons[key]; ok {
-		return s.fnName
-	}
-	s := &singleton{
-		pkg:        c.pkg,
-		name:       c.name,
-		out:        c.out,
-		ins:        c.ins,
-		varargs:    c.varargs,
-		hasCleanup: c.hasCleanup,
-		hasErr:     c.hasErr,
-	}
-	s.fnName = typeVariableName(c.out, "singleton", func(name string) string {
-		return "_wire" + export(name) + "Singleton"
-	}, g.nameInFileScope)
-	g.singletonNames[s.fnName] = true
-	newName := func(suffix string) string {
-		n := disambiguate(s.fnName+suffix, g.nameInFileScope)
-		g.singletonNames[n] = true
-		return n
-	}
-	s.valueName = newName("Value")
-	if s.hasErr {
-		s.errName = newName("Err")
-	}
-	if s.hasCleanup {
-		s.muName = newName("Mu")
-		s.refsName = newName("Refs")
-		s.cleanupName = newName("Cleanup")
-		s.releaseName = newName("Release")
-	} else {
-		s.onceName = newName("Once")
-	}
-	g.singletons[key] = s
-	return s.fnName
+// pkgSingletons holds the canonical singleton wrappers generated into one
+// package that contains wire.Singleton calls. The wrappers cover every
+// wire.Singleton call in the package — not just the ones reachable from a
+// particular injector — so the generated file's content is the same no
+// matter which injector package triggered generation.
+type pkgSingletons struct {
+	pkg *packages.Package
+	// byKey maps provider identity (pkgpath.FuncName) to its wrapper.
+	byKey map[string]*singleton
+	// ordered is sorted by provider identity for deterministic output.
+	ordered []*singleton
 }
 
-// emitSingletons appends the wrapper functions and state variables for all
-// registered singletons, in deterministic order.
-func (g *gen) emitSingletons() {
-	if len(g.singletons) == 0 {
+// singletonProviderKey identifies the provider function behind a singleton.
+func singletonProviderKey(pkgPath, funcName string) string {
+	return pkgPath + "." + funcName
+}
+
+// findPackageSingletons scans dpkg for wire.Singleton calls and allocates
+// the wrapper identifiers for each distinct provider. Wrapper functions are
+// exported so injectors generated into other packages can call them; state
+// variables stay unexported. Names are deterministic: providers are sorted
+// by identity before allocation, and collisions are checked against the
+// package scope (the previously generated wire_singleton_gen.go is tagged
+// !wireinject, so it is not part of the scope wire loads).
+func findPackageSingletons(oc *objectCache, dpkg *packages.Package) (*pkgSingletons, []error) {
+	ps := &pkgSingletons{pkg: dpkg, byKey: make(map[string]*singleton)}
+	ec := new(errorCollector)
+	var provs []*Provider
+	seen := make(map[string]bool)
+	for _, f := range dpkg.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			obj := qualifiedIdentObject(dpkg.TypesInfo, call.Fun)
+			if obj == nil || obj.Pkg() == nil || !isWireImport(obj.Pkg().Path()) || obj.Name() != "Singleton" {
+				return true
+			}
+			p, errs := oc.processSingleton(dpkg.TypesInfo, dpkg.PkgPath, call)
+			if len(errs) > 0 {
+				ec.add(notePositionAll(oc.fset.Position(call.Pos()), errs)...)
+				return true
+			}
+			key := singletonProviderKey(p.Pkg.Path(), p.Name)
+			if !seen[key] {
+				seen[key] = true
+				provs = append(provs, p)
+			}
+			return true
+		})
+	}
+	if len(ec.errors) > 0 {
+		return nil, ec.errors
+	}
+	sort.Slice(provs, func(i, j int) bool {
+		return singletonProviderKey(provs[i].Pkg.Path(), provs[i].Name) <
+			singletonProviderKey(provs[j].Pkg.Path(), provs[j].Name)
+	})
+	taken := make(map[string]bool)
+	collides := func(name string) bool {
+		if taken[name] {
+			return true
+		}
+		_, obj := dpkg.Types.Scope().LookupParent(name, token.NoPos)
+		return obj != nil
+	}
+	newName := func(name string) string {
+		name = disambiguate(name, collides)
+		taken[name] = true
+		return name
+	}
+	for _, p := range provs {
+		s := &singleton{
+			pkg:        p.Pkg,
+			name:       p.Name,
+			out:        p.Out[0],
+			ins:        make([]types.Type, len(p.Args)),
+			varargs:    p.Varargs,
+			hasCleanup: p.HasCleanup,
+			hasErr:     p.HasErr,
+		}
+		for i, a := range p.Args {
+			s.ins[i] = a.Type
+		}
+		s.fnName = newName("Singleton" + export(p.Name))
+		base := unexport(s.fnName)
+		s.valueName = newName(base + "Value")
+		if s.hasErr {
+			s.errName = newName(base + "Err")
+		}
+		if s.hasCleanup {
+			s.muName = newName(base + "Mu")
+			s.refsName = newName(base + "Refs")
+			s.cleanupName = newName(base + "Cleanup")
+			s.releaseName = newName("release" + s.fnName)
+		} else {
+			s.onceName = newName(base + "Once")
+		}
+		key := singletonProviderKey(p.Pkg.Path(), p.Name)
+		ps.byKey[key] = s
+		ps.ordered = append(ps.ordered, s)
+	}
+	return ps, nil
+}
+
+// singletonCallee returns the qualified name of the generated wrapper for a
+// wire.Singleton provider call and records the declaring package so its
+// wire_singleton_gen.go file is generated too.
+func (g *gen) singletonCallee(c *call) (string, []error) {
+	ps, errs := g.singletonIndex(c.singletonPkgPath)
+	if len(errs) > 0 {
+		return "", errs
+	}
+	s := ps.byKey[singletonProviderKey(c.pkg.Path(), c.name)]
+	if s == nil {
+		return "", []error{fmt.Errorf("internal error: no singleton wrapper for %s.%s in package %s", c.pkg.Path(), c.name, c.singletonPkgPath)}
+	}
+	g.usedSingletonPkgs[c.singletonPkgPath] = true
+	return g.qualifiedID(ps.pkg.Name, ps.pkg.PkgPath, s.fnName), nil
+}
+
+// emitPackageSingletons appends the wrapper functions and state variables
+// for every singleton declared in the package, in deterministic order.
+func (g *gen) emitPackageSingletons(ps *pkgSingletons) {
+	if len(ps.ordered) == 0 {
 		return
 	}
-	keys := make([]string, 0, len(g.singletons))
-	for k := range g.singletons {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 	syncPkg := g.qualifyImport("sync", "sync")
 	g.p("// Singleton wrappers:\n\n")
-	for _, k := range keys {
-		s := g.singletons[k]
+	for _, s := range ps.ordered {
 		if s.hasCleanup {
 			g.emitRefcountSingleton(s, syncPkg)
 		} else {
@@ -907,6 +1049,8 @@ func (g *gen) emitOnceSingleton(s *singleton, syncPkg string) {
 	g.p(")\n\n")
 	params, callArgs := g.singletonParams(s)
 	providerCall := fmt.Sprintf("%s(%s)", g.qualifiedID(s.pkg.Name(), s.pkg.Path(), s.name), callArgs)
+	g.p("// %s memoizes %s. It is generated by Wire because\n", s.fnName, s.name)
+	g.p("// %s is wrapped in wire.Singleton in this package.\n", s.name)
 	if s.hasErr {
 		g.p("func %s(%s) (%s, error) {\n", s.fnName, params, outType)
 	} else {
@@ -946,6 +1090,8 @@ func (g *gen) emitRefcountSingleton(s *singleton, syncPkg string) {
 	g.p(")\n\n")
 	params, callArgs := g.singletonParams(s)
 	providerCall := fmt.Sprintf("%s(%s)", g.qualifiedID(s.pkg.Name(), s.pkg.Path(), s.name), callArgs)
+	g.p("// %s memoizes %s. It is generated by Wire because\n", s.fnName, s.name)
+	g.p("// %s is wrapped in wire.Singleton in this package.\n", s.name)
 	if s.hasErr {
 		g.p("func %s(%s) (%s, func(), error) {\n", s.fnName, params, outType)
 	} else {

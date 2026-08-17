@@ -6,14 +6,10 @@
 
 package main
 
-import (
-	"sync"
-)
-
 // Injectors from wire.go:
 
 func injectBar(cfg Config, opts ...string) (*Bar, func(), error) {
-	foo, cleanup, err := _wireFooSingleton(
+	foo, cleanup, err := SingletonProvideFoo(
 		cfg,
 		opts...,
 	)
@@ -29,93 +25,11 @@ func injectBar(cfg Config, opts ...string) (*Bar, func(), error) {
 }
 
 func injectBaz() (*Baz, func(), error) {
-	baz, cleanup, err := _wireBazSingleton()
+	baz, cleanup, err := SingletonProvideBaz()
 	if err != nil {
 		return nil, nil, err
 	}
 	return baz, func() {
 		cleanup()
 	}, nil
-}
-
-// Singleton wrappers:
-
-var (
-	_wireBazSingletonMu      sync.Mutex
-	_wireBazSingletonRefs    int
-	_wireBazSingletonValue   *Baz
-	_wireBazSingletonCleanup func()
-	_wireBazSingletonErr     error
-)
-
-func _wireBazSingleton() (*Baz, func(), error) {
-	_wireBazSingletonMu.Lock()
-	defer _wireBazSingletonMu.Unlock()
-	if _wireBazSingletonErr != nil {
-		return nil, nil, _wireBazSingletonErr
-	}
-	if _wireBazSingletonRefs == 0 {
-		_wireBazSingletonValue, _wireBazSingletonCleanup, _wireBazSingletonErr = provideBaz()
-		if _wireBazSingletonErr != nil {
-			return nil, nil, _wireBazSingletonErr
-		}
-	}
-	_wireBazSingletonRefs++
-	return _wireBazSingletonValue, _wireBazSingletonRelease, nil
-}
-
-func _wireBazSingletonRelease() {
-	_wireBazSingletonMu.Lock()
-	defer _wireBazSingletonMu.Unlock()
-	if _wireBazSingletonRefs == 0 {
-		return
-	}
-	_wireBazSingletonRefs--
-	if _wireBazSingletonRefs == 0 {
-		if _wireBazSingletonCleanup != nil {
-			_wireBazSingletonCleanup()
-		}
-		_wireBazSingletonValue = nil
-		_wireBazSingletonCleanup = nil
-	}
-}
-
-var (
-	_wireFooSingletonMu      sync.Mutex
-	_wireFooSingletonRefs    int
-	_wireFooSingletonValue   *Foo
-	_wireFooSingletonCleanup func()
-	_wireFooSingletonErr     error
-)
-
-func _wireFooSingleton(config Config, arg1 ...string) (*Foo, func(), error) {
-	_wireFooSingletonMu.Lock()
-	defer _wireFooSingletonMu.Unlock()
-	if _wireFooSingletonErr != nil {
-		return nil, nil, _wireFooSingletonErr
-	}
-	if _wireFooSingletonRefs == 0 {
-		_wireFooSingletonValue, _wireFooSingletonCleanup, _wireFooSingletonErr = provideFoo(config, arg1...)
-		if _wireFooSingletonErr != nil {
-			return nil, nil, _wireFooSingletonErr
-		}
-	}
-	_wireFooSingletonRefs++
-	return _wireFooSingletonValue, _wireFooSingletonRelease, nil
-}
-
-func _wireFooSingletonRelease() {
-	_wireFooSingletonMu.Lock()
-	defer _wireFooSingletonMu.Unlock()
-	if _wireFooSingletonRefs == 0 {
-		return
-	}
-	_wireFooSingletonRefs--
-	if _wireFooSingletonRefs == 0 {
-		if _wireFooSingletonCleanup != nil {
-			_wireFooSingletonCleanup()
-		}
-		_wireFooSingletonValue = nil
-		_wireFooSingletonCleanup = nil
-	}
 }
