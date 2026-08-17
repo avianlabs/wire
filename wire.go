@@ -30,8 +30,8 @@ type ProviderSet struct{}
 
 // NewSet creates a new provider set that includes the providers in its
 // arguments. Each argument is a function value, a provider set, a call to
-// Struct, a call to Bind, a call to Value, a call to InterfaceValue or a call
-// to FieldsOf.
+// Struct, a call to Bind, a call to Value, a call to InterfaceValue, a call
+// to FieldsOf, or a call to Singleton.
 //
 // Passing a function value to NewSet declares that the function's first
 // return value type will be provided by calling the function. The arguments
@@ -193,4 +193,37 @@ type StructFields struct{}
 //	example above).
 func FieldsOf(structType interface{}, fieldNames ...string) StructFields {
 	return StructFields{}
+}
+
+// A SingletonProvider is a provider function whose result is memoized.
+type SingletonProvider struct{}
+
+// Singleton wraps a provider function so that generated injectors memoize
+// its result. The provider runs at most once per generated package: the
+// first injector call to need the value invokes the provider, and every
+// subsequent request — from the same injector or any other injector in the
+// same generated package — receives the same value.
+//
+// Only a provider function may be wrapped: wire.Struct, wire.Value, struct
+// literals, and provider sets are rejected at generation time.
+//
+// Semantics:
+//
+//   - Scope is the generated package (wire_gen.go), not the whole binary.
+//     Injectors generated into different packages each get their own
+//     instance.
+//   - The provider's arguments are taken from the first call that creates
+//     the value; arguments passed by later calls are ignored.
+//   - If the provider returns an error, the error is cached: the provider
+//     is never retried and every subsequent request returns the same error.
+//   - If the provider returns a cleanup function, references are counted.
+//     Each injector's cleanup releases one reference; when the last
+//     reference is released the provider's cleanup runs and the singleton
+//     resets, so a later injector call creates a fresh value.
+//
+// Example:
+//
+//	var Set = wire.NewSet(wire.Singleton(NewFoo), NewBar)
+func Singleton(provider interface{}) SingletonProvider {
+	return SingletonProvider{}
 }

@@ -1,0 +1,5 @@
+example.com/foo/wire.go:x:y: argument to Singleton must be a provider function
+
+example.com/foo/wire.go:x:y: argument to Singleton must be a provider function
+
+example.com/foo/wire.go:x:y: argument to Singleton must be a provider function

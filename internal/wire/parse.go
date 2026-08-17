@@ -56,6 +56,9 @@ func (p *providerSetSrc) description(fset *token.FileSet, typ types.Type) string
 		if p.Provider.IsStruct {
 			kind = "struct provider"
 		}
+		if p.Provider.IsSingleton {
+			kind = "singleton provider"
+		}
 		return fmt.Sprintf("%s %s(%s)", kind, quoted(p.Provider.Name), fset.Position(p.Provider.Pos))
 	case p.Binding != nil:
 		return fmt.Sprintf("wire.Bind (%s)", fset.Position(p.Binding.Pos))
@@ -165,6 +168,11 @@ type Provider struct {
 	// IsStruct is true if this provider is a named struct type.
 	// Otherwise it's a function.
 	IsStruct bool
+
+	// IsSingleton is true if this provider was wrapped in wire.Singleton.
+	// Generated code memoizes the provider's result per generated package.
+	// (Always false for structs.)
+	IsSingleton bool
 
 	// Out is the set of types this provider produces. It will always
 	// contain at least one type.
@@ -591,6 +599,12 @@ func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Ex
 				return nil, []error{notePosition(exprPos, err)}
 			}
 			return v, nil
+		case "Singleton":
+			p, errs := oc.processSingleton(info, pkgPath, call)
+			if len(errs) > 0 {
+				return nil, notePositionAll(exprPos, errs)
+			}
+			return p, nil
 		default:
 			return nil, []error{notePosition(exprPos, errors.New("unknown pattern"))}
 		}
@@ -717,6 +731,29 @@ func processFuncProvider(fset *token.FileSet, fn *types.Func) (*Provider, []erro
 		}
 	}
 	return provider, nil
+}
+
+// processSingleton creates a memoized provider from a wire.Singleton call.
+func (oc *objectCache) processSingleton(info *types.Info, pkgPath string, call *ast.CallExpr) (*Provider, []error) {
+	// Assumes that call.Fun is wire.Singleton.
+	if len(call.Args) != 1 {
+		return nil, []error{notePosition(oc.fset.Position(call.Pos()),
+			errors.New("call to Singleton takes exactly one argument"))}
+	}
+	item, errs := oc.processExpr(info, pkgPath, call.Args[0], "")
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	p, ok := item.(*Provider)
+	if !ok || p.IsStruct {
+		return nil, []error{notePosition(oc.fset.Position(call.Pos()),
+			errors.New("argument to Singleton must be a provider function"))}
+	}
+	// Copy the provider: the object cache shares *Provider values, and the
+	// same function must remain usable un-wrapped elsewhere.
+	pCopy := *p
+	pCopy.IsSingleton = true
+	return &pCopy, nil
 }
 
 func injectorFuncSignature(sig *types.Signature) (*types.Tuple, outputSignature, error) {
