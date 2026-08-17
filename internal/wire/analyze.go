@@ -79,6 +79,9 @@ type call struct {
 	hasCleanup bool
 	// hasErr is true if the provider call returns an error.
 	hasErr bool
+	// isSingleton is true if the provider call is memoized via
+	// wire.Singleton and must go through the generated wrapper.
+	isSingleton bool
 
 	// The following are only set for kind == valueExpr:
 
@@ -196,16 +199,17 @@ dfs:
 				}
 			}
 			calls = append(calls, call{
-				kind:       kind,
-				pkg:        p.Pkg,
-				name:       p.Name,
-				args:       args,
-				varargs:    p.Varargs,
-				fieldNames: fieldNames,
-				ins:        ins,
-				out:        curr.t,
-				hasCleanup: p.HasCleanup,
-				hasErr:     p.HasErr,
+				kind:        kind,
+				pkg:         p.Pkg,
+				name:        p.Name,
+				args:        args,
+				varargs:     p.Varargs,
+				fieldNames:  fieldNames,
+				ins:         ins,
+				out:         curr.t,
+				hasCleanup:  p.HasCleanup,
+				hasErr:      p.HasErr,
+				isSingleton: p.IsSingleton,
 			})
 		case pv.IsValue():
 			v := pv.Value()

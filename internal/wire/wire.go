@@ -104,6 +104,7 @@ func Generate(ctx context.Context, wd string, env []string, patterns []string, o
 			continue
 		}
 		copyNonInjectorDecls(g, injectorFiles, pkg.TypesInfo)
+		g.emitSingletons()
 		goSrc := g.frame(opts.Tags)
 		if len(opts.Header) > 0 {
 			goSrc = append(opts.Header, goSrc...)
@@ -246,14 +247,23 @@ type gen struct {
 	imports     map[string]importInfo
 	anonImports map[string]bool
 	values      map[ast.Expr]string
+	// singletons maps provider identity (pkgpath.FuncName) to the wrapper
+	// generated for a wire.Singleton provider. Injectors in the same
+	// package share one wrapper — that sharing is the singleton.
+	singletons map[string]*singleton
+	// singletonNames records every identifier allocated for singleton
+	// wrappers so nameInFileScope avoids them.
+	singletonNames map[string]bool
 }
 
 func newGen(pkg *packages.Package) *gen {
 	return &gen{
-		pkg:         pkg,
-		anonImports: make(map[string]bool),
-		imports:     make(map[string]importInfo),
-		values:      make(map[ast.Expr]string),
+		pkg:            pkg,
+		anonImports:    make(map[string]bool),
+		imports:        make(map[string]importInfo),
+		values:         make(map[ast.Expr]string),
+		singletons:     make(map[string]*singleton),
+		singletonNames: make(map[string]bool),
 	}
 }
 
@@ -562,6 +572,9 @@ func (g *gen) nameInFileScope(name string) bool {
 			return true
 		}
 	}
+	if g.singletonNames[name] {
+		return true
+	}
 	_, obj := g.pkg.Types.Scope().LookupParent(name, token.NoPos)
 	return obj != nil
 }
@@ -670,6 +683,10 @@ func injectPass(name string, sig *types.Signature, calls []call, set *ProviderSe
 }
 
 func (ig *injectorGen) funcProviderCall(lname string, c *call, injectSig outputSignature) {
+	callee := ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name)
+	if c.isSingleton {
+		callee = ig.g.singleton(c)
+	}
 	ig.p("\t%s", lname)
 	prevCleanup := len(ig.cleanupNames)
 	if c.hasCleanup {
@@ -685,10 +702,10 @@ func (ig *injectorGen) funcProviderCall(lname string, c *call, injectSig outputS
 	// Format function calls with multi-line arguments for better readability
 	if len(c.args) == 0 {
 		// No arguments - keep on single line
-		ig.p("%s()\n", ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name))
+		ig.p("%s()\n", callee)
 	} else {
 		// Multiple arguments - format each on its own line
-		ig.p("%s(\n", ig.g.qualifiedID(c.pkg.Name(), c.pkg.Path(), c.name))
+		ig.p("%s(\n", callee)
 		for i, a := range c.args {
 			ig.p("\t\t")
 			if a < len(ig.paramNames) {
@@ -752,6 +769,224 @@ func (ig *injectorGen) fieldExpr(lname string, c *call) {
 	} else {
 		ig.p("%s.%s\n", ig.localNames[a-len(ig.paramNames)], c.name)
 	}
+}
+
+// singleton is the state for one wire.Singleton provider's generated
+// wrapper: the memoizing function plus its package-level state variables.
+type singleton struct {
+	pkg        *types.Package
+	name       string
+	out        types.Type
+	ins        []types.Type
+	varargs    bool
+	hasCleanup bool
+	hasErr     bool
+
+	// Identifiers in the generated file.
+	fnName    string // wrapper function
+	valueName string // cached value var
+	errName   string // cached error var (hasErr only)
+	// Without cleanup: sync.Once-based wrapper.
+	onceName string
+	// With cleanup: mutex + refcount wrapper.
+	muName      string
+	refsName    string
+	cleanupName string
+	releaseName string
+}
+
+// singleton returns the wrapper function name for the provider behind c,
+// registering the wrapper (and reserving its identifiers) on first use.
+func (g *gen) singleton(c *call) string {
+	key := c.pkg.Path() + "." + c.name
+	if s, ok := g.singletons[key]; ok {
+		return s.fnName
+	}
+	s := &singleton{
+		pkg:        c.pkg,
+		name:       c.name,
+		out:        c.out,
+		ins:        c.ins,
+		varargs:    c.varargs,
+		hasCleanup: c.hasCleanup,
+		hasErr:     c.hasErr,
+	}
+	s.fnName = typeVariableName(c.out, "singleton", func(name string) string {
+		return "_wire" + export(name) + "Singleton"
+	}, g.nameInFileScope)
+	g.singletonNames[s.fnName] = true
+	newName := func(suffix string) string {
+		n := disambiguate(s.fnName+suffix, g.nameInFileScope)
+		g.singletonNames[n] = true
+		return n
+	}
+	s.valueName = newName("Value")
+	if s.hasErr {
+		s.errName = newName("Err")
+	}
+	if s.hasCleanup {
+		s.muName = newName("Mu")
+		s.refsName = newName("Refs")
+		s.cleanupName = newName("Cleanup")
+		s.releaseName = newName("Release")
+	} else {
+		s.onceName = newName("Once")
+	}
+	g.singletons[key] = s
+	return s.fnName
+}
+
+// emitSingletons appends the wrapper functions and state variables for all
+// registered singletons, in deterministic order.
+func (g *gen) emitSingletons() {
+	if len(g.singletons) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(g.singletons))
+	for k := range g.singletons {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	syncPkg := g.qualifyImport("sync", "sync")
+	g.p("// Singleton wrappers:\n\n")
+	for _, k := range keys {
+		s := g.singletons[k]
+		if s.hasCleanup {
+			g.emitRefcountSingleton(s, syncPkg)
+		} else {
+			g.emitOnceSingleton(s, syncPkg)
+		}
+	}
+}
+
+// singletonParams builds the wrapper's parameter list and the matching
+// argument list for calling the wrapped provider.
+func (g *gen) singletonParams(s *singleton) (params, callArgs string) {
+	var paramNames []string
+	collides := func(n string) bool {
+		if g.nameInFileScope(n) {
+			return true
+		}
+		for _, p := range paramNames {
+			if p == n {
+				return true
+			}
+		}
+		return false
+	}
+	pb := new(strings.Builder)
+	cb := new(strings.Builder)
+	for i, t := range s.ins {
+		if i > 0 {
+			pb.WriteString(", ")
+			cb.WriteString(", ")
+		}
+		n := typeVariableName(t, fmt.Sprintf("arg%d", i), unexport, collides)
+		paramNames = append(paramNames, n)
+		if s.varargs && i == len(s.ins)-1 {
+			fmt.Fprintf(pb, "%s ...%s", n, types.TypeString(t.(*types.Slice).Elem(), g.qualifyPkg))
+			fmt.Fprintf(cb, "%s...", n)
+		} else {
+			fmt.Fprintf(pb, "%s %s", n, types.TypeString(t, g.qualifyPkg))
+			cb.WriteString(n)
+		}
+	}
+	return pb.String(), cb.String()
+}
+
+// emitOnceSingleton writes a sync.Once-based wrapper for a provider with no
+// cleanup. Errors, if any, are cached and returned on every call.
+func (g *gen) emitOnceSingleton(s *singleton, syncPkg string) {
+	outType := types.TypeString(s.out, g.qualifyPkg)
+	g.p("var (\n")
+	g.p("\t%s %s.Once\n", s.onceName, syncPkg)
+	g.p("\t%s %s\n", s.valueName, outType)
+	if s.hasErr {
+		g.p("\t%s error\n", s.errName)
+	}
+	g.p(")\n\n")
+	params, callArgs := g.singletonParams(s)
+	providerCall := fmt.Sprintf("%s(%s)", g.qualifiedID(s.pkg.Name(), s.pkg.Path(), s.name), callArgs)
+	if s.hasErr {
+		g.p("func %s(%s) (%s, error) {\n", s.fnName, params, outType)
+	} else {
+		g.p("func %s(%s) %s {\n", s.fnName, params, outType)
+	}
+	g.p("\t%s.Do(func() {\n", s.onceName)
+	if s.hasErr {
+		g.p("\t\t%s, %s = %s\n", s.valueName, s.errName, providerCall)
+	} else {
+		g.p("\t\t%s = %s\n", s.valueName, providerCall)
+	}
+	g.p("\t})\n")
+	if s.hasErr {
+		g.p("\treturn %s, %s\n", s.valueName, s.errName)
+	} else {
+		g.p("\treturn %s\n", s.valueName)
+	}
+	g.p("}\n\n")
+}
+
+// emitRefcountSingleton writes a mutex+refcount wrapper for a provider with
+// a cleanup function. Each caller receives the shared release func as its
+// cleanup; the last release runs the provider's cleanup and resets the
+// value state so a later call re-creates the singleton. A cached error is
+// sticky: it is returned forever and takes no reference.
+func (g *gen) emitRefcountSingleton(s *singleton, syncPkg string) {
+	outType := types.TypeString(s.out, g.qualifyPkg)
+	zero := zeroValue(s.out, g.qualifyPkg)
+	g.p("var (\n")
+	g.p("\t%s %s.Mutex\n", s.muName, syncPkg)
+	g.p("\t%s int\n", s.refsName)
+	g.p("\t%s %s\n", s.valueName, outType)
+	g.p("\t%s func()\n", s.cleanupName)
+	if s.hasErr {
+		g.p("\t%s error\n", s.errName)
+	}
+	g.p(")\n\n")
+	params, callArgs := g.singletonParams(s)
+	providerCall := fmt.Sprintf("%s(%s)", g.qualifiedID(s.pkg.Name(), s.pkg.Path(), s.name), callArgs)
+	if s.hasErr {
+		g.p("func %s(%s) (%s, func(), error) {\n", s.fnName, params, outType)
+	} else {
+		g.p("func %s(%s) (%s, func()) {\n", s.fnName, params, outType)
+	}
+	g.p("\t%s.Lock()\n", s.muName)
+	g.p("\tdefer %s.Unlock()\n", s.muName)
+	if s.hasErr {
+		g.p("\tif %s != nil {\n", s.errName)
+		g.p("\t\treturn %s, nil, %s\n", zero, s.errName)
+		g.p("\t}\n")
+	}
+	g.p("\tif %s == 0 {\n", s.refsName)
+	if s.hasErr {
+		g.p("\t\t%s, %s, %s = %s\n", s.valueName, s.cleanupName, s.errName, providerCall)
+		g.p("\t\tif %s != nil {\n", s.errName)
+		g.p("\t\t\treturn %s, nil, %s\n", zero, s.errName)
+		g.p("\t\t}\n")
+	} else {
+		g.p("\t\t%s, %s = %s\n", s.valueName, s.cleanupName, providerCall)
+	}
+	g.p("\t}\n")
+	g.p("\t%s++\n", s.refsName)
+	if s.hasErr {
+		g.p("\treturn %s, %s, nil\n", s.valueName, s.releaseName)
+	} else {
+		g.p("\treturn %s, %s\n", s.valueName, s.releaseName)
+	}
+	g.p("}\n\n")
+	g.p("func %s() {\n", s.releaseName)
+	g.p("\t%s.Lock()\n", s.muName)
+	g.p("\tdefer %s.Unlock()\n", s.muName)
+	g.p("\t%s--\n", s.refsName)
+	g.p("\tif %s == 0 {\n", s.refsName)
+	g.p("\t\tif %s != nil {\n", s.cleanupName)
+	g.p("\t\t\t%s()\n", s.cleanupName)
+	g.p("\t\t}\n")
+	g.p("\t\t%s = %s\n", s.valueName, zero)
+	g.p("\t\t%s = nil\n", s.cleanupName)
+	g.p("\t}\n")
+	g.p("}\n\n")
 }
 
 // nameInInjector reports whether name collides with any other identifier
