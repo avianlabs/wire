@@ -40,8 +40,10 @@ existing provider sets and injectors work unchanged after updating the import
 path. On top of that, it adds:
 
 - **`wire.Singleton`** — wrap a provider function so generated injectors
-  memoize its result. The provider runs at most once per generated package,
-  errors are cached, and cleanup functions are reference-counted across
+  memoize its result. The memoizing wrapper is generated into the package
+  that declares the singleton, so the provider runs at most once per binary
+  and injectors generated into different packages share one instance.
+  Errors are cached and cleanup functions are reference-counted across
   injectors. See the [User Guide][singleton guide] for details.
 - **Multi-line generated calls** — provider calls in `wire_gen.go` are
   formatted with one argument per line, making generated code easier to read
