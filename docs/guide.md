@@ -452,6 +452,42 @@ func provideFile(log Logger, path Path) (*os.File, func(), error) {
 A cleanup function is guaranteed to be called before the cleanup function of any
 of the provider's inputs and must have the signature `func()`.
 
+### Singleton Providers
+
+`wire.Singleton` wraps a provider function so that generated injectors
+memoize its result. The provider runs at most once per generated package:
+the first injector call to need the value invokes the provider, and every
+subsequent request — from the same injector or any other injector in the
+same generated package — receives the same value. This is useful for
+expensive shared resources such as database pools or API clients.
+
+```go
+var Set = wire.NewSet(
+    wire.Singleton(NewFoo),
+    NewBar,
+)
+```
+
+Only a provider function may be wrapped; `wire.Struct`, `wire.Value`,
+struct literals, and provider sets are rejected at generation time.
+
+Semantics to be aware of:
+
+-   **Scope is the generated package**, not the whole binary. The
+    memoization state lives in `wire_gen.go`, so injectors generated into
+    different packages each get their own instance. If all of your
+    injectors live in one wiring package (the common case), the singleton
+    is effectively per-binary.
+-   **The first call's arguments win.** Because the provider runs once,
+    arguments passed by later injector calls are ignored.
+-   **Errors are sticky.** If the provider returns an error, the error is
+    cached and returned on every subsequent request; the provider is never
+    retried.
+-   **Cleanup is reference-counted.** If the provider returns a cleanup
+    function, each injector's cleanup releases one reference. When the
+    last reference is released, the provider's cleanup runs and the
+    singleton resets, so a later injector call creates a fresh value.
+
 ### Alternate Injector Syntax
 
 If you grow weary of writing `return foobarbaz.Foo{}, nil` at the end of your
