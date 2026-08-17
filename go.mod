@@ -13,3 +13,7 @@ require (
 	golang.org/x/mod v0.27.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
 )
+
+// v0.8.0 was re-tagged after the module proxy had cached the original tag,
+// so the proxy permanently serves stale content for it. Use v0.8.1 instead.
+retract v0.8.0
