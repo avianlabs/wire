@@ -18,6 +18,8 @@
 package main
 
 import (
+	"example.com/bar"
+
 	"github.com/avianlabs/wire"
 )
 
