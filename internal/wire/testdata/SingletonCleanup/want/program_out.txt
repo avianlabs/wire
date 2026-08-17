@@ -1,0 +1,7 @@
+1
+true
+released one
+cleanup foo 1
+2
+2
+cleanup foo 2
