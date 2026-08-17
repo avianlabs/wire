@@ -126,5 +126,6 @@ simpler.
 
 Wire is still fairly new and doesn't have a large user base yet. However, we
 have heard a lot of interest from Go users wanting to simplify their
-applications. If your project or company uses Wire, please let us know by either
-emailing us or sending a pull request amending this section.
+applications. If your project or company uses Wire, please let us know by
+posting in [GitHub Discussions](https://github.com/avianlabs/wire/discussions)
+or sending a pull request amending this section.
